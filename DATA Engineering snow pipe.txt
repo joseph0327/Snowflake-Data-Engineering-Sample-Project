@@ -1,0 +1,180 @@
+DATA Engineering snow pipe
+
+CREATE OR REPLACE PIPE PIPE_GET_NEW_FILES
+auto_ingest=true
+aws_sns_topic='arn:aws:sns:us-west-2:321463406630:dngw_topic'
+AS 
+COPY INTO ED_PIPELINE_LOGS
+FROM (
+    SELECT 
+    METADATA$FILENAME as log_file_name 
+  , METADATA$FILE_ROW_NUMBER as log_file_row_id 
+  , current_timestamp(0) as load_ltz 
+  , get($1,'datetime_iso8601')::timestamp_ntz as DATETIME_ISO8601
+  , get($1,'user_event')::text as USER_EVENT
+  , get($1,'user_login')::text as USER_LOGIN
+  , get($1,'ip_address')::text as IP_ADDRESS    
+  FROM @AGS_GAME_AUDIENCE.RAW.UNI_KISHORE_PIPELINE
+)
+file_format = (format_name = ff_json_logs);
+
+--Use this command if your Snowpipe seems like it is stalled out:
+ALTER PIPE ags_game_audience.raw.PIPE_GET_NEW_FILES REFRESH;
+
+--Use this command if you want to check that your pipe is running:
+select parse_json(SYSTEM$PIPE_STATUS( 'ags_game_audience.raw.PIPE_GET_NEW_FILES' ));
+
+-- Pause pipe execution
+ALTER PIPE AGS_GAME_AUDIENCE.RAW.PIPE_GET_NEW_FILES SET PIPE_EXECUTION_PAUSED = TRUE;
+
+--tp verify the pause
+SELECT SYSTEM$PIPE_STATUS('AGS_GAME_AUDIENCE.RAW.PIPE_GET_NEW_FILES');
+
+--to run the pipe
+ALTER PIPE AGS_GAME_AUDIENCE.RAW.PIPE_GET_NEW_FILES SET PIPE_EXECUTION_PAUSED = FALSE;
+
+-- why is it called event driven
+-- Event-driven approach
+-- 1. A file arrives in S3.
+-- 2. S3 immediately generates an event.
+-- 3. The event is sent to SNS.
+-- 4. SNS notifies Snowpipe.
+-- 5. Snowpipe loads the file automatically.
+
+
+
+
+--################ CREATING A STREAM FOR EVENT DRIVEN + CDC ##############
+
+--create a stream that will keep track of changes to the table
+create or replace stream ags_game_audience.raw.ed_cdc_stream 
+on table AGS_GAME_AUDIENCE.RAW.ED_PIPELINE_LOGS;
+
+--look at the stream you created
+show streams;
+
+--check to see if any changes are pending (expect FALSE the first time you run it)
+--after the Snowpipe loads a new file, expect to see TRUE
+select system$stream_has_data('ed_cdc_stream');
+
+--But in production use, to use streams effectively, you will need to understand offsets, data retention periods, staleness, and stream types. We're not covering those in this workshop.
+
+
+--check the data store in the pipe
+SELECT * FROM ags_game_audience.raw.ED_PIPELINE_LOGS
+
+--query the stream
+select * 
+from ags_game_audience.raw.ed_cdc_stream; 
+
+--check to see if any changes are pending
+select system$stream_has_data('ed_cdc_stream');
+
+--if your stream remains empty for more than 10 minutes, make sure your PIPE is running
+select SYSTEM$PIPE_STATUS('PIPE_GET_NEW_FILES');
+
+--if you need to pause or unpause your pipe
+alter pipe PIPE_GET_NEW_FILES set pipe_execution_paused = true;
+alter pipe PIPE_GET_NEW_FILES set pipe_execution_paused = false;
+
+
+--make a note of how many rows are in the stream
+select * 
+from ags_game_audience.raw.ed_cdc_stream; 
+
+ 
+--process the stream by using the rows in a merge 
+MERGE INTO AGS_GAME_AUDIENCE.ENHANCED.LOGS_ENHANCED e
+USING (
+        SELECT cdc.ip_address 
+        , cdc.user_login as GAMER_NAME
+        , cdc.user_event as GAME_EVENT_NAME
+        , cdc.datetime_iso8601 as GAME_EVENT_UTC
+        , city
+        , region
+        , country
+        , timezone as GAMER_LTZ_NAME
+        , CONVERT_TIMEZONE( 'UTC',timezone,cdc.datetime_iso8601) as game_event_ltz
+        , DAYNAME(game_event_ltz) as DOW_NAME
+        , TOD_NAME
+        from ags_game_audience.raw.ed_cdc_stream cdc
+        JOIN ipinfo_geoloc.demo.location loc 
+        ON ipinfo_geoloc.public.TO_JOIN_KEY(cdc.ip_address) = loc.join_key
+        AND ipinfo_geoloc.public.TO_INT(cdc.ip_address) 
+        BETWEEN start_ip_int AND end_ip_int
+        JOIN AGS_GAME_AUDIENCE.RAW.TIME_OF_DAY_LU tod
+        ON HOUR(game_event_ltz) = tod.hour
+      ) r
+ON r.GAMER_NAME = e.GAMER_NAME
+AND r.GAME_EVENT_UTC = e.GAME_EVENT_UTC
+AND r.GAME_EVENT_NAME = e.GAME_EVENT_NAME 
+WHEN NOT MATCHED THEN 
+INSERT (IP_ADDRESS, GAMER_NAME, GAME_EVENT_NAME
+        , GAME_EVENT_UTC, CITY, REGION
+        , COUNTRY, GAMER_LTZ_NAME, GAME_EVENT_LTZ
+        , DOW_NAME, TOD_NAME)
+        VALUES
+        (IP_ADDRESS, GAMER_NAME, GAME_EVENT_NAME
+        , GAME_EVENT_UTC, CITY, REGION
+        , COUNTRY, GAMER_LTZ_NAME, GAME_EVENT_LTZ
+        , DOW_NAME, TOD_NAME);
+ 
+--Did all the rows from the stream disappear? 
+select * 
+from ags_game_audience.raw.ed_cdc_stream; 
+
+SELECT * FROM AGS_GAME_AUDIENCE.ENHANCED.LOGS_ENHANCED
+SELECT * FROM AGS_GAME_AUDIENCE.raw.ED_PIPELINE_LOGS
+
+--###reasons Streams can be very complex. Since the information disappears as you process it, when using a stream in production systems, you will likely want to have more protection in place to make sure you don't lose information.
+
+
+--###Create a CDC-Fueled, Time-Driven Task
+--Create a new task that uses the MERGE you just tested
+create or replace task AGS_GAME_AUDIENCE.RAW.CDC_LOAD_LOGS_ENHANCED
+	USER_TASK_MANAGED_INITIAL_WAREHOUSE_SIZE='XSMALL'
+	SCHEDULE = '5 minutes'
+WHEN
+    system$stream_has_data('ed_cdc_stream')
+	as 
+MERGE INTO AGS_GAME_AUDIENCE.ENHANCED.LOGS_ENHANCED e
+USING (
+        SELECT cdc.ip_address 
+        , cdc.user_login as GAMER_NAME
+        , cdc.user_event as GAME_EVENT_NAME
+        , cdc.datetime_iso8601 as GAME_EVENT_UTC
+        , city
+        , region
+        , country
+        , timezone as GAMER_LTZ_NAME
+        , CONVERT_TIMEZONE( 'UTC',timezone,cdc.datetime_iso8601) as game_event_ltz
+        , DAYNAME(game_event_ltz) as DOW_NAME
+        , TOD_NAME
+        from ags_game_audience.raw.ed_cdc_stream cdc
+        JOIN ipinfo_geoloc.demo.location loc 
+        ON ipinfo_geoloc.public.TO_JOIN_KEY(cdc.ip_address) = loc.join_key
+        AND ipinfo_geoloc.public.TO_INT(cdc.ip_address) 
+        BETWEEN start_ip_int AND end_ip_int
+        JOIN AGS_GAME_AUDIENCE.RAW.TIME_OF_DAY_LU tod
+        ON HOUR(game_event_ltz) = tod.hour
+      ) r
+ON r.GAMER_NAME = e.GAMER_NAME
+AND r.GAME_EVENT_UTC = e.GAME_EVENT_UTC
+AND r.GAME_EVENT_NAME = e.GAME_EVENT_NAME 
+WHEN NOT MATCHED THEN 
+INSERT (IP_ADDRESS, GAMER_NAME, GAME_EVENT_NAME
+        , GAME_EVENT_UTC, CITY, REGION
+        , COUNTRY, GAMER_LTZ_NAME, GAME_EVENT_LTZ
+        , DOW_NAME, TOD_NAME)
+        VALUES
+        (IP_ADDRESS, GAMER_NAME, GAME_EVENT_NAME
+        , GAME_EVENT_UTC, CITY, REGION
+        , COUNTRY, GAMER_LTZ_NAME, GAME_EVENT_LTZ
+        , DOW_NAME, TOD_NAME);
+        
+--Resume the task so it is running
+alter task AGS_GAME_AUDIENCE.RAW.CDC_LOAD_LOGS_ENHANCED resume;
+alter task AGS_GAME_AUDIENCE.RAW.CDC_LOAD_LOGS_ENHANCED suspend;
+
+
+execute task AGS_GAME_AUDIENCE.RAW.CDC_LOAD_LOGS_ENHANCED;
