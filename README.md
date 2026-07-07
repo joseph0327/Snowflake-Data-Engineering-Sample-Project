@@ -440,9 +440,7 @@ Merge Task
       │
       ▼
 Curated Tables
-      │
-      ▼
-Dashboard
+
 ```
 
 ---
@@ -489,6 +487,3 @@ Dashboard
 
 
 
-
-
-## ⭐ If you found this project helpful, consider giving the repository a star!
